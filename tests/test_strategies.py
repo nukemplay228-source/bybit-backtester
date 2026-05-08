@@ -7,7 +7,10 @@ import pytest
 
 from bybit_backtest.backtest import run_backtest
 from bybit_backtest.strategies import (
+    BollingerBandsStrategy,
     DCAStrategy,
+    DonchianBreakoutStrategy,
+    MACDStrategy,
     RSIMeanReversionStrategy,
     SMACrossStrategy,
     SpotGridStrategy,
@@ -44,6 +47,29 @@ def test_dca_invalid_params() -> None:
         DCAStrategy(interval_bars=0)
     with pytest.raises(ValueError):
         DCAStrategy(cash_per_buy=-1)
+
+
+def test_macd_invalid_params() -> None:
+    with pytest.raises(ValueError):
+        MACDStrategy(fast=26, slow=12)
+    with pytest.raises(ValueError):
+        MACDStrategy(fast=0)
+    with pytest.raises(ValueError):
+        MACDStrategy(signal=-1)
+
+
+def test_bollinger_invalid_params() -> None:
+    with pytest.raises(ValueError):
+        BollingerBandsStrategy(period=1)
+    with pytest.raises(ValueError):
+        BollingerBandsStrategy(num_std=0)
+
+
+def test_donchian_invalid_params() -> None:
+    with pytest.raises(ValueError):
+        DonchianBreakoutStrategy(entry_period=1)
+    with pytest.raises(ValueError):
+        DonchianBreakoutStrategy(exit_period=1)
 
 
 def test_sma_cross_runs_and_records_equity(crossing_bars: pd.DataFrame) -> None:
@@ -91,3 +117,31 @@ def test_rsi_runs_on_oscillating(oscillating_bars: pd.DataFrame) -> None:
     )
     # We should see at least a couple of round trips on a sinusoid.
     assert len(result.trades) >= 2
+
+
+def test_macd_takes_at_least_one_trade(crossing_bars: pd.DataFrame) -> None:
+    strategy = MACDStrategy(fast=6, slow=15, signal=4)
+    result = run_backtest(
+        crossing_bars, strategy, initial_cash=1000.0, fee_rate=0.001, slippage=0.0
+    )
+    assert len(result.equity) == len(crossing_bars)
+    # Crossing bars trend down then up — MACD should fire a buy.
+    assert (result.trades["side"] == "BUY").sum() >= 1
+
+
+def test_bollinger_round_trips_on_oscillating(oscillating_bars: pd.DataFrame) -> None:
+    strategy = BollingerBandsStrategy(period=20, num_std=1.5)
+    result = run_backtest(
+        oscillating_bars, strategy, initial_cash=1000.0, fee_rate=0.0, slippage=0.0
+    )
+    assert (result.trades["side"] == "BUY").sum() >= 1
+    assert (result.trades["side"] == "SELL").sum() >= 1
+
+
+def test_donchian_breakout_buys_on_uptrend(crossing_bars: pd.DataFrame) -> None:
+    strategy = DonchianBreakoutStrategy(entry_period=10, exit_period=5)
+    result = run_backtest(
+        crossing_bars, strategy, initial_cash=1000.0, fee_rate=0.001, slippage=0.0
+    )
+    # The clear up-trend in the second half should trigger at least one breakout.
+    assert (result.trades["side"] == "BUY").sum() >= 1

@@ -26,6 +26,9 @@ sanity-check an idea **before** risking any money.
   - `rsi_mr` — RSI mean reversion (Wilder's smoothing)
   - `grid` — spot grid bot (pre-defined price range)
   - `dca` — dollar-cost averaging (passive benchmark)
+  - `macd` — MACD signal-line crossover
+  - `bollinger` — Bollinger Bands mean reversion
+  - `donchian` — Donchian channel breakout (Turtle-style)
 - **Honest metrics**: total return, CAGR, max drawdown, Sharpe, Sortino,
   volatility, win rate, profit factor, average trade.
 - **Outputs**: trades CSV, equity CSV, JSON report, equity-curve PNG (with a
@@ -139,6 +142,28 @@ Pass strategy parameters as a JSON dict via `--params`.
 | `interval_bars`  | int   | 24      | Buy every N bars.                      |
 | `cash_per_buy`   | float | 10.0    | Cash spent on each buy.                |
 
+### `macd`
+
+| Param    | Type | Default | Notes                                                    |
+|----------|------|---------|----------------------------------------------------------|
+| `fast`   | int  | 12      | Fast EMA period. Must be < `slow`.                       |
+| `slow`   | int  | 26      | Slow EMA period.                                         |
+| `signal` | int  | 9       | EMA period applied to the MACD line itself.              |
+
+### `bollinger`
+
+| Param     | Type  | Default | Notes                                          |
+|-----------|-------|---------|------------------------------------------------|
+| `period`  | int   | 20      | Lookback window for the moving average / std.  |
+| `num_std` | float | 2.0     | Width of the bands in standard deviations.     |
+
+### `donchian`
+
+| Param           | Type | Default | Notes                                                  |
+|-----------------|------|---------|--------------------------------------------------------|
+| `entry_period`  | int  | 55      | Breakout lookback. Buy on close > prior N highs.       |
+| `exit_period`   | int  | 20      | Exit lookback. Sell on close < prior M lows.           |
+
 ## How the engine works
 
 1. **Bars in chronological order.** Each bar contains `open, high, low, close,
@@ -183,6 +208,9 @@ src/bybit_backtest/
     rsi_mr.py
     grid.py
     dca.py
+    macd.py
+    bollinger.py
+    donchian.py
   metrics.py      # Performance metrics (return, drawdown, Sharpe, ...)
   backtest.py     # Bar-by-bar engine
   plotting.py     # Equity curve + drawdown chart
