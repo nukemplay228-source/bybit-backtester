@@ -6,6 +6,12 @@ from bybit_backtest.strategies.dca import DCAStrategy
 from bybit_backtest.strategies.donchian import DonchianBreakoutStrategy
 from bybit_backtest.strategies.grid import SpotGridStrategy
 from bybit_backtest.strategies.macd import MACDStrategy
+from bybit_backtest.strategies.predictor import (
+    PredictorStrategy,
+    SignalScore,
+    evaluate_signals,
+    latest_signal_score,
+)
 from bybit_backtest.strategies.rsi_mr import RSIMeanReversionStrategy
 from bybit_backtest.strategies.sma_cross import SMACrossStrategy
 
@@ -17,6 +23,7 @@ STRATEGY_REGISTRY: dict[str, type[Strategy]] = {
     "macd": MACDStrategy,
     "bollinger": BollingerBandsStrategy,
     "donchian": DonchianBreakoutStrategy,
+    "predictor": PredictorStrategy,
 }
 
 
@@ -38,10 +45,14 @@ __all__ = [
     "MACDStrategy",
     "Order",
     "OrderSide",
+    "PredictorStrategy",
     "RSIMeanReversionStrategy",
     "SMACrossStrategy",
+    "SignalScore",
     "SpotGridStrategy",
     "Strategy",
     "StrategyContext",
     "build_strategy",
+    "evaluate_signals",
+    "latest_signal_score",
 ]
