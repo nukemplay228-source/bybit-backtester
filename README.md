@@ -29,6 +29,9 @@ sanity-check an idea **before** risking any money.
   - `macd` — MACD signal-line crossover
   - `bollinger` — Bollinger Bands mean reversion
   - `donchian` — Donchian channel breakout (Turtle-style)
+- **Funding-rate arbitrage backtest** (cash-and-carry: long spot + short
+  perpetual, delta-neutral, collect funding payments). See the
+  [Funding-rate arbitrage](#funding-rate-arbitrage-cash-and-carry) section.
 - **Honest metrics**: total return, CAGR, max drawdown, Sharpe, Sortino,
   volatility, win rate, profit factor, average trade.
 - **Outputs**: trades CSV, equity CSV, JSON report, equity-curve PNG (with a
@@ -163,6 +166,89 @@ Pass strategy parameters as a JSON dict via `--params`.
 |-----------------|------|---------|--------------------------------------------------------|
 | `entry_period`  | int  | 55      | Breakout lookback. Buy on close > prior N highs.       |
 | `exit_period`   | int  | 20      | Exit lookback. Sell on close < prior M lows.           |
+
+## Funding-rate arbitrage (cash-and-carry)
+
+The `funding-arb` subcommand simulates the classic delta-neutral
+cash-and-carry trade: **buy 1 unit of spot** and **simultaneously short 1
+unit of the same asset on a USDT-margined perpetual**. Spot gains and perp
+losses (or vice versa) cancel out, so the only meaningful P&L is the funding
+payment paid every 8 hours from longs to shorts (positive funding) or from
+shorts to longs (negative funding) — minus fees and slippage.
+
+Funding rates on Bybit / KuCoin / Binance are **public information** —
+arbitrageurs close the gap between exchanges, so KuCoin's funding rate is a
+reasonable proxy for Bybit's. The backtester uses **KuCoin** public data
+(spot klines, perp klines, funding-rate history) because KuCoin is reachable
+from most cloud regions while `api.bybit.com` is geo-blocked from many.
+
+```bash
+python -m bybit_backtest funding-arb \
+    --symbol BTC \
+    --start 2024-01-01 --end 2025-01-01 \
+    --notional 1000 \
+    --initial-margin-rate 0.33 \
+    --maintenance-margin-rate 0.05
+```
+
+The simulator opens both legs on bar 0, posts initial margin on the perp
+leg, marks-to-market every 8 hours (the funding settlement cadence), credits
+funding payments to the perp account, and closes both legs on the last bar.
+Liquidation is checked at every settlement; by default it uses **cross
+margin** — i.e. the spot leg's market value is treated as collateral for the
+perp short, which is how unified accounts on Bybit / KuCoin behave. Pass
+`--margin-mode isolated` to model an isolated-margin perp account (which can
+liquidate even on a delta-neutral position if the perp leg moves against you
+faster than you can top up).
+
+### Backtest results — BTC & ETH
+
+Run on KuCoin 8h data, $1000 per leg, 33% initial margin, 5% maintenance
+margin, 0.10% spot taker fee, 0.06% perp taker fee, 5 bps slippage per side,
+cross margin:
+
+| Period            | Total return | Annualised | Funding (USD) | Fees (USD) | Max drawdown | Liquidated |
+|-------------------|--------------|------------|---------------|-----------|--------------|------------|
+| BTC 2022 (bear)   | +1.16%       | +1.17%     | +18.58        | 2.17      | -0.59%       | no         |
+| BTC 2023 (mixed)  | +16.76%      | +16.79%    | +233.43       | 5.69      | -0.45%       | no         |
+| BTC 2024 (bull)   | +21.77%      | +21.75%    | +299.13       | 5.14      | -0.48%       | no         |
+| ETH 2024 (bull)   | +20.62%      | +20.59%    | +281.04       | 3.94      | -0.26%       | no         |
+
+CSV summary and PNG charts are written under `results/funding_arb/` after
+running `python build_arb_summary.py`.
+
+### What the numbers mean (in plain English)
+
+- **In bull markets** (2023–2024) the trade earned **~17–22% per year**,
+  about **1.4–1.8% per month**, paid in roughly steady 8h drips with very
+  small drawdowns (<0.6% of capital deployed).
+- **In a bear market** (2022) funding rates collapsed (longs aren't paying
+  premium when nobody is leveraged-long), and the trade returned a flat
+  **~1% per year** — barely above zero, definitely not a passive-income
+  machine.
+- The strategy is **not magic** — it requires real capital on **two**
+  exchanges (or a unified account), real fees, and real margin
+  monitoring. A 50% spike in basis or a single mistimed top-up can wipe
+  weeks of funding.
+- Numbers are based on **KuCoin** funding history. Bybit's rates are
+  similar but not identical; expect ±2–3 percentage points in either
+  direction.
+
+### Caveats
+
+- **Past funding ≠ future funding.** Rates compress during bears and
+  during periods of low retail leverage.
+- **Execution risk.** Real-life entry/exit at the same price on two
+  venues is harder than in the backtest.
+- **Counterparty risk.** Holding capital on a centralized exchange
+  always carries platform-risk (FTX, etc.).
+- **No transfers / borrowing modelled.** If you need to move USDT
+  between spot and futures accounts there can be small fees and delays.
+
+The conclusion: funding-rate arb is one of the more realistic ways to earn
+**low-double-digit annualised returns** on crypto with **delta-neutral
+exposure**. It's not "stable monthly income" — bear markets cut returns to
+near-zero — but it's far closer to that ideal than directional trading.
 
 ## How the engine works
 
