@@ -1,0 +1,6 @@
+{
+  "low": 90000,
+  "high": 110000,
+  "levels": 20,
+  "capital_fraction": 1.0
+}
