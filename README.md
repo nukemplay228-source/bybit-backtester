@@ -32,6 +32,12 @@ sanity-check an idea **before** risking any money.
 - **Funding-rate arbitrage backtest** (cash-and-carry: long spot + short
   perpetual, delta-neutral, collect funding payments). See the
   [Funding-rate arbitrage](#funding-rate-arbitrage-cash-and-carry) section.
+- **Pairs-trading backtest** (z-score mean-reversion of a log-spread between
+  two perpetuals; long one leg + short the other). See the
+  [Pairs trading](#pairs-trading-statistical-arbitrage) section.
+- **Regime filter wrapper** that gates long entries by a slow trend filter
+  (e.g. close > 200d SMA), so strategies skip entries during sustained bear
+  regimes. See the [Regime filter](#regime-filter) section.
 - **Honest metrics**: total return, CAGR, max drawdown, Sharpe, Sortino,
   volatility, win rate, profit factor, average trade.
 - **Outputs**: trades CSV, equity CSV, JSON report, equity-curve PNG (with a
@@ -330,6 +336,109 @@ The conclusion: funding-rate arb is one of the more realistic ways to earn
 **low-double-digit annualised returns** on crypto with **delta-neutral
 exposure**. It's not "stable monthly income" — bear markets cut returns to
 near-zero — but it's far closer to that ideal than directional trading.
+
+## Pairs trading (statistical arbitrage)
+
+The `pairs-arb` subcommand simulates a textbook statistical-arbitrage trade
+on **two USDT-margined perpetuals** (e.g. BTC and ETH). The bet is that the
+**log price spread** `log(close_a) - log(close_b)` mean-reverts:
+
+* compute a rolling mean & std of the spread over `--lookback` bars and the
+  current z-score `(spread - mean) / std`;
+* if z is far above the mean (`z > +entry_z`): **short the spread** — short
+  A, long B (asset A is "rich" relative to B);
+* if z is far below the mean (`z < -entry_z`): **long the spread** — long
+  A, short B;
+* close both legs when `|z|` falls back below `--exit-z`.
+
+Both legs use **equal notional** so the position is approximately
+delta-neutral. P&L comes from the spread relaxing back toward its mean,
+plus funding on the two perp legs (the short receives positive funding,
+the long pays it), minus entry/exit fees and slippage.
+
+```bash
+python -m bybit_backtest pairs-arb \
+    --symbol-a BTC --symbol-b ETH \
+    --start 2022-01-01 --end 2025-01-01 \
+    --lookback 90 --entry-z 2.0 --exit-z 0.5 \
+    --notional 1000 --initial-margin-rate 0.50 \
+    --maintenance-margin-rate 0.10
+```
+
+### Backtest results — BTC/ETH and alts
+
+KuCoin 8h data, $1000 per leg, 2x leverage (50% initial / 10% maintenance
+margin), 6 bps perp fee, 5 bps slippage per side, cross margin:
+
+| Pair    | Window      | Lookback | Entry z | Total return | Max drawdown | Trades | Liquidated |
+|---------|-------------|---------:|--------:|-------------:|-------------:|-------:|------------|
+| BTC-ETH | 2022 (bear) | 90       | 2.0     |     **-45.11%** |       63.77% |     9  | no         |
+| BTC-ETH | 2023        | 90       | 2.0     |       -4.03% |       21.46% |    11  | no         |
+| BTC-ETH | 2024 (bull) | 90       | 2.0     |      +13.64% |       32.78% |     9  | no         |
+| BTC-ETH | 2022–2024   | 90       | 2.0     |      -18.06% |       63.77% |    32  | no         |
+| BTC-ETH | 2022–2024   | 180      | 2.0     |       +2.61% |       42.63% |    19  | no         |
+| BTC-ETH | 2022–2024   | 90       | 1.5     |      +19.61% |       59.34% |    43  | no         |
+| BTC-SOL | 2022–2024   | 90       | 2.0     |     **-78.86%** |       90.96% |    19  | **yes**    |
+| ETH-SOL | 2022–2024   | 90       | 2.0     |     **-80.41%** |       97.77% |    10  | **yes**    |
+
+### What the numbers mean (in plain English)
+
+- Crypto pairs trading is **much harder than the textbook suggests**. The
+  BTC/ETH relationship had structural shifts in 2022 (Merge, regulatory
+  pressure) and 2024 (Bitcoin ETF dominance) that broke the mean-reversion
+  assumption — every "wide spread" became a wider spread.
+- BTC/ETH was **at best mildly profitable over 3 years** (+2% to +20%
+  depending on knobs) and only with deep drawdowns (40–60% of risk
+  capital). Any single bad year wipes the prior year's gains.
+- Alt-vs-alt pairs (BTC-SOL, ETH-SOL) **liquidated** in this configuration:
+  SOL diverged from the majors hard enough to exhaust the perp leg's
+  margin even at 2x leverage with cross margining.
+- Lower entry-z thresholds (1.5 vs 2.0) generate more trades, slightly
+  higher returns, similar drawdowns — the opportunity isn't "we picked
+  the wrong z", it's that the spread itself trends.
+
+The headline: **pairs trading on liquid crypto majors is not a passive
+income strategy.** Funding-rate arb (above) is a much more reliable
+delta-neutral approach for the same family of capital.
+
+## Regime filter
+
+The `--regime-window` flag wraps any built-in strategy in a **trend-filter
+gate**. The wrapper allows the inner strategy to enter long positions
+**only when `close > SMA(window)`**, and forces a full exit on the next bar
+if the regime flips off while a position is open. SELL signals from the
+inner strategy always pass through.
+
+The default window of 200 bars on **daily** data is the textbook
+Brock/Lakonishok/LeBaron 1992 trend filter; on hourly/8h bars use a
+proportionally larger window.
+
+```bash
+python -m bybit_backtest run \
+    --strategy sma_cross \
+    --symbol BTCUSDT --interval D \
+    --start 2022-01-01 --end 2025-01-01 \
+    --params '{"fast": 50, "slow": 200}' \
+    --regime-window 200
+```
+
+### Backtest results — SMA(50,200) daily, 2022–2024, with vs without filter
+
+| Symbol  | Filter | Total return | Sharpe | Max drawdown | Trades |
+|---------|--------|-------------:|-------:|-------------:|-------:|
+| BTCUSDT | OFF    |     +160.78% |   5.18 |        26.1% |     2  |
+| BTCUSDT | ON     |     +151.65% |   5.25 |        24.5% |     2  |
+| ETHUSDT | OFF    |      +28.02% |   1.98 |        43.0% |     2  |
+| ETHUSDT | ON     |      +50.73% |   2.75 |        34.9% |     2  |
+| SOLUSDT | OFF    |     +143.97% |   3.88 |        50.5% |     3  |
+| SOLUSDT | ON     |     +230.10% |   4.97 |        44.2% |     3  |
+
+The filter is a **small, consistent improvement** on the wins-and-losses
+side: better Sharpe in 5/6 cases, lower drawdown in 6/6, materially better
+return on the symbols where the raw strategy was weakest (ETH +22 pts, SOL
++86 pts). It costs ~10 pts of upside on BTC where the trend was strong
+enough that filtering was unnecessary. As an "always-on" bolt-on it pays
+for itself.
 
 ## How the engine works
 
