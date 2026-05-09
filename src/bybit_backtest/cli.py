@@ -22,13 +22,14 @@ import argparse
 import json
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
 from bybit_backtest._version import __version__
 from bybit_backtest.backtest import run_backtest
-from bybit_backtest.data import load_klines
+from bybit_backtest.data import INTERVAL_MS, load_klines
 from bybit_backtest.data_csv import SUPPORTED_INTERVALS as CSV_SUPPORTED
 from bybit_backtest.data_csv import load_klines_csv
 from bybit_backtest.data_kucoin import (
@@ -39,6 +40,7 @@ from bybit_backtest.data_kucoin import (
 from bybit_backtest.funding_arb import FundingArbConfig, run_funding_arb
 from bybit_backtest.pairs_arb import PairsArbConfig, run_pairs_arb
 from bybit_backtest.plotting import buy_and_hold_equity, plot_equity_curve
+from bybit_backtest.predict import build_report
 from bybit_backtest.regime import RegimeFilteredStrategy, sma_trend_filter
 from bybit_backtest.scanner import scan_assets
 from bybit_backtest.strategies import STRATEGY_REGISTRY, build_strategy
@@ -131,6 +133,60 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("list-strategies", help="List built-in strategies.")
+
+    predict = sub.add_parser(
+        "predict",
+        help="Print a multi-signal directional report for the most recent bar.",
+    )
+    predict.add_argument("--symbol", required=True, help="e.g. BTCUSDT")
+    predict.add_argument(
+        "--interval",
+        required=True,
+        help="Bybit interval: 1, 5, 15, 30, 60, 240, 720, D, W, M, ...",
+    )
+    predict.add_argument(
+        "--lookback-bars",
+        type=int,
+        default=500,
+        help=(
+            "How many recent bars to download for indicator computation "
+            "(default: 500). Must comfortably exceed the slowest indicator "
+            "window (default 200 EMA)."
+        ),
+    )
+    predict.add_argument(
+        "--category",
+        default="spot",
+        choices=["spot", "linear", "inverse"],
+        help="Bybit market category (default: spot). Only applies when --source=api.",
+    )
+    predict.add_argument(
+        "--source",
+        default="api",
+        choices=["api", "public_csv"],
+        help=(
+            "Where to fetch klines from. 'api' uses api.bybit.com (default). "
+            "'public_csv' uses the static CSV archives at public.bybit.com."
+        ),
+    )
+    predict.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass the on-disk kline cache and re-download from Bybit.",
+    )
+    predict.add_argument(
+        "--params",
+        default="{}",
+        help=(
+            "JSON dict of predictor parameters, e.g. "
+            '\'{"min_score": 4, "atr_stop_mult": 2.0}\''
+        ),
+    )
+    predict.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the report as a single JSON object instead of formatted text.",
+    )
 
     arb = sub.add_parser(
         "funding-arb",
@@ -527,6 +583,95 @@ def _cmd_list(_: argparse.Namespace) -> int:
     return 0
 
 
+def _bars_for_predict(args: argparse.Namespace) -> pd.DataFrame:
+    """Download enough recent bars for the predictor to evaluate."""
+    if args.lookback_bars < 50:
+        print("--lookback-bars must be at least 50", file=sys.stderr)
+        raise SystemExit(2)
+    if args.interval not in INTERVAL_MS:
+        print(
+            f"unknown interval {args.interval!r}; "
+            f"expected one of {sorted(INTERVAL_MS)}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    bar_ms = INTERVAL_MS[args.interval]
+    end = datetime.now(tz=timezone.utc).replace(microsecond=0)
+    start = end - timedelta(milliseconds=bar_ms * args.lookback_bars)
+    start_str = start.strftime("%Y-%m-%d %H:%M:%S")
+    end_str = end.strftime("%Y-%m-%d %H:%M:%S")
+
+    if args.source == "public_csv":
+        if args.interval not in CSV_SUPPORTED:
+            print(
+                f"--source=public_csv only supports intervals {sorted(CSV_SUPPORTED)}; "
+                f"got {args.interval!r}.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        bars = load_klines_csv(
+            args.symbol,
+            args.interval,
+            start_str,
+            end_str,
+            use_cache=not args.no_cache,
+        )
+    else:
+        bars = load_klines(
+            args.symbol,
+            args.interval,
+            start_str,
+            end_str,
+            category=args.category,
+            use_cache=not args.no_cache,
+        )
+    return bars
+
+
+def _cmd_predict(args: argparse.Namespace) -> int:
+    try:
+        params = json.loads(args.params) if args.params else {}
+    except json.JSONDecodeError as exc:
+        print(f"Invalid --params JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(params, dict):
+        print("--params must decode to a JSON object", file=sys.stderr)
+        return 2
+
+    bars = _bars_for_predict(args)
+    if bars.empty:
+        print(
+            f"No klines returned for {args.symbol} {args.interval} (last {args.lookback_bars} bars)",
+            file=sys.stderr,
+        )
+        return 1
+    logger.info("Loaded %d bars (%s -> %s)", len(bars), bars.index[0], bars.index[-1])
+
+    try:
+        report = build_report(
+            bars,
+            symbol=args.symbol,
+            interval=args.interval,
+            **params,
+        )
+    except (TypeError, ValueError) as exc:
+        print(f"Could not build prediction: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, default=str))
+    else:
+        print(report.to_text())
+        print()
+        print(
+            "DISCLAIMER: this is a snapshot of indicator alignment, NOT a guaranteed "
+            "forecast. Past readings do not predict future returns; trade size is your "
+            "responsibility."
+        )
+    return 0
+
+
 def _cmd_funding_arb(args: argparse.Namespace) -> int:
     symbol = args.symbol.upper()
     spot_pair = f"{symbol}-USDT"
@@ -905,6 +1050,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(args)
     if args.command == "list-strategies":
         return _cmd_list(args)
+    if args.command == "predict":
+        return _cmd_predict(args)
     if args.command == "funding-arb":
         return _cmd_funding_arb(args)
     if args.command == "pairs-arb":
