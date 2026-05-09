@@ -167,6 +167,87 @@ Pass strategy parameters as a JSON dict via `--params`.
 | `entry_period`  | int  | 55      | Breakout lookback. Buy on close > prior N highs.       |
 | `exit_period`   | int  | 20      | Exit lookback. Sell on close < prior M lows.           |
 
+## Walk-forward validation & multi-asset scan
+
+Picking the best `(fast, slow)` for SMA on a single year of BTC and then
+"trusting" that result is the textbook way to fool yourself — you've selected
+the parameters that look best **in hindsight**. Two CLI subcommands help guard
+against that.
+
+### `sweep` — walk-forward parameter search
+
+Splits the price history into rolling **(train, test)** windows of fixed bar
+counts. For each window, every combination from `--param-grid` is evaluated on
+the **train** slice; the winner (by `--metric`) is then re-evaluated on the
+**test** slice — bars the optimiser has never seen. The output table reports
+both the in-sample and out-of-sample numbers, so the gap between them is
+visible.
+
+```bash
+python -m bybit_backtest sweep \
+    --strategy sma_cross \
+    --symbol BTCUSDT --interval D \
+    --start 2022-01-01 --end 2025-01-01 \
+    --param-grid '{"fast": [5, 10, 20, 30, 50], "slow": [50, 100, 150, 200]}' \
+    --train-bars 365 --test-bars 180 \
+    --metric sharpe \
+    --output-dir results/walk_forward
+```
+
+Example output for SMA crossover on BTC daily, 2022–2024 (train = 365 bars,
+test = 180 bars, 4 walk-forward windows):
+
+| Test window         | Best train params    | Train Sharpe | Test Sharpe | Test return | Test drawdown |
+|---------------------|----------------------|-------------:|------------:|------------:|--------------:|
+| 2023-01 → 2023-06   | fast=5,  slow=150    |        0.00  |       2.31  |     +15.43% |         2.00% |
+| 2023-06 → 2023-12   | fast=10, slow=200    |        1.32  |       0.00  |       0.00% |         0.00% |
+| 2023-12 → 2024-06   | fast=5,  slow=50     |        2.00  |      -0.31  |      -2.88% |         8.85% |
+| 2024-06 → 2024-12   | fast=5,  slow=50     |        2.14  |       2.41  |     +48.56% |         8.39% |
+| **Average**         |                      |       1.36   |       1.10  |     +15.28% |               |
+
+Two of four out-of-sample windows are positive, one is flat (the strategy
+never re-entered), one is a small loss. A sample of 4 is too small to draw
+strong conclusions, but the procedure makes that explicit instead of hiding it
+behind a single in-sample number.
+
+### `scan` — multi-asset scanner
+
+Runs the **same strategy with one fixed parameter set** across many symbols
+and ranks them by Sharpe. A real edge should generalise across at least
+several liquid pairs; an "edge" that only works on one symbol is usually
+overfitting.
+
+```bash
+python -m bybit_backtest scan \
+    --strategy sma_cross \
+    --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,DOTUSDT,LINKUSDT,AVAXUSDT \
+    --interval D \
+    --start 2022-01-01 --end 2025-01-01 \
+    --params '{"fast": 50, "slow": 200}' \
+    --output-dir results/scanner
+```
+
+Example output for SMA(50, 200) daily, 2022–2024:
+
+| Symbol   | Total return | Sharpe | Max drawdown | Trades |
+|----------|-------------:|-------:|-------------:|-------:|
+| BTCUSDT  |    +160.78%  |   1.06 |        26.1% |      2 |
+| SOLUSDT  |    +143.97%  |   0.79 |        50.5% |      3 |
+| DOGEUSDT |    +124.77%  |   0.74 |        52.7% |      2 |
+| XRPUSDT  |     +66.03%  |   0.54 |        68.3% |      4 |
+| BNBUSDT  |     +53.70%  |   0.55 |        43.8% |      3 |
+| AVAXUSDT |     +42.86%  |   0.49 |        47.9% |      2 |
+| ETHUSDT  |     +28.02%  |   0.40 |        43.0% |      2 |
+| LINKUSDT |     +26.73%  |   0.40 |        46.2% |      3 |
+| ADAUSDT  |      -2.20%  |   0.21 |        46.1% |      3 |
+| DOTUSDT  |     -32.23%  |  -0.10 |        60.3% |      2 |
+
+8/10 symbols profitable, mean return +61%, mean Sharpe +0.51 — i.e. SMA(50,
+200) "works" across the broader market over this period, but the edge is
+modest, max drawdowns are high (40–70% on alts), and DOT was a clean loss.
+Compare these numbers to **buy-and-hold** of the same asset before you decide
+the strategy is interesting.
+
 ## Funding-rate arbitrage (cash-and-carry)
 
 The `funding-arb` subcommand simulates the classic delta-neutral
