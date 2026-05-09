@@ -38,8 +38,10 @@ from bybit_backtest.data_kucoin import (
     fetch_spot_klines,
 )
 from bybit_backtest.funding_arb import FundingArbConfig, run_funding_arb
+from bybit_backtest.pairs_arb import PairsArbConfig, run_pairs_arb
 from bybit_backtest.plotting import buy_and_hold_equity, plot_equity_curve
 from bybit_backtest.predict import build_report
+from bybit_backtest.regime import RegimeFilteredStrategy, sma_trend_filter
 from bybit_backtest.scanner import scan_assets
 from bybit_backtest.strategies import STRATEGY_REGISTRY, build_strategy
 from bybit_backtest.sweep import SUPPORTED_METRICS, walk_forward
@@ -118,6 +120,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-benchmark",
         action="store_true",
         help="Skip drawing the buy-and-hold benchmark on the chart.",
+    )
+    run.add_argument(
+        "--regime-window",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, wrap the strategy in a regime filter that only allows long "
+            "entries when close > SMA(window). Forces an exit when the regime "
+            "flips off. Set to 0 (default) to disable."
+        ),
     )
 
     sub.add_parser("list-strategies", help="List built-in strategies.")
@@ -247,6 +259,90 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Directory where reports and equity-curve plots are written.",
     )
     arb.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass the on-disk data cache and re-download from KuCoin.",
+    )
+
+    pairs = sub.add_parser(
+        "pairs-arb",
+        help=(
+            "Backtest a delta-neutral pairs-trading strategy on two perpetuals "
+            "(z-score mean-reversion of log price spread)."
+        ),
+    )
+    pairs.add_argument(
+        "--symbol-a",
+        default="BTC",
+        help="First leg symbol root (e.g. BTC). KuCoin perp = X<SYM>USDTM for BTC, <SYM>USDTM otherwise.",
+    )
+    pairs.add_argument(
+        "--symbol-b",
+        default="ETH",
+        help="Second leg symbol root (e.g. ETH).",
+    )
+    pairs.add_argument("--start", required=True, help="UTC start date, YYYY-MM-DD")
+    pairs.add_argument("--end", required=True, help="UTC end date, YYYY-MM-DD (exclusive)")
+    pairs.add_argument(
+        "--lookback",
+        type=int,
+        default=30,
+        help="Bars of history for the rolling z-score mean/std (default 30 = ~10 days at 8h).",
+    )
+    pairs.add_argument(
+        "--entry-z",
+        type=float,
+        default=2.0,
+        help="Absolute z-score threshold to open a position (default 2.0).",
+    )
+    pairs.add_argument(
+        "--exit-z",
+        type=float,
+        default=0.5,
+        help="Absolute z-score threshold to close (default 0.5).",
+    )
+    pairs.add_argument(
+        "--notional",
+        type=float,
+        default=1000.0,
+        help="USD notional per leg (both legs equal). Default 1000.",
+    )
+    pairs.add_argument(
+        "--initial-margin-rate",
+        type=float,
+        default=0.10,
+        help="Initial margin per leg as a fraction of notional (default 0.10 = 10x).",
+    )
+    pairs.add_argument(
+        "--maintenance-margin-rate",
+        type=float,
+        default=0.05,
+        help="Maintenance margin per leg (default 0.05).",
+    )
+    pairs.add_argument(
+        "--fee-rate",
+        type=float,
+        default=0.0006,
+        help="Perp taker fee per leg (default 0.0006 = 6 bps).",
+    )
+    pairs.add_argument(
+        "--slippage",
+        type=float,
+        default=0.0005,
+        help="One-sided slippage applied to entry/exit on each leg.",
+    )
+    pairs.add_argument(
+        "--margin-mode",
+        choices=("cross", "isolated"),
+        default="cross",
+        help="cross = both legs share collateral; isolated = each leg margins separately.",
+    )
+    pairs.add_argument(
+        "--output-dir",
+        default="results",
+        help="Directory where reports and equity-curve CSVs are written.",
+    )
+    pairs.add_argument(
         "--no-cache",
         action="store_true",
         help="Bypass the on-disk data cache and re-download from KuCoin.",
@@ -392,6 +488,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 2
 
     strategy = build_strategy(args.strategy, params)
+    if args.regime_window > 0:
+        strategy = RegimeFilteredStrategy(
+            inner=strategy, regime_fn=sma_trend_filter(args.regime_window)
+        )
     logger.info("Built strategy %s with params %s", strategy.name, strategy.describe())
 
     if args.source == "public_csv":
@@ -660,6 +760,109 @@ def _cmd_funding_arb(args: argparse.Namespace) -> int:
     return 0
 
 
+def _kucoin_perp_symbol(root: str) -> str:
+    root = root.upper()
+    return "XBTUSDTM" if root == "BTC" else f"{root}USDTM"
+
+
+def _cmd_pairs_arb(args: argparse.Namespace) -> int:
+    a_root = args.symbol_a.upper()
+    b_root = args.symbol_b.upper()
+    if a_root == b_root:
+        print("--symbol-a and --symbol-b must differ", file=sys.stderr)
+        return 2
+
+    perp_a = _kucoin_perp_symbol(a_root)
+    perp_b = _kucoin_perp_symbol(b_root)
+
+    use_cache = not args.no_cache
+    a_klines = fetch_perp_klines(perp_a, "480", args.start, args.end, use_cache=use_cache)
+    b_klines = fetch_perp_klines(perp_b, "480", args.start, args.end, use_cache=use_cache)
+    a_funding = fetch_funding_rates(perp_a, args.start, args.end, use_cache=use_cache)
+    b_funding = fetch_funding_rates(perp_b, args.start, args.end, use_cache=use_cache)
+    if a_klines.empty or b_klines.empty or a_funding.empty or b_funding.empty:
+        print(
+            "KuCoin returned empty data for one or more legs "
+            f"(a_klines={len(a_klines)}, b_klines={len(b_klines)}, "
+            f"a_funding={len(a_funding)}, b_funding={len(b_funding)}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    config = PairsArbConfig(
+        lookback=args.lookback,
+        entry_z=args.entry_z,
+        exit_z=args.exit_z,
+        notional_per_leg=args.notional,
+        initial_margin_rate=args.initial_margin_rate,
+        maintenance_margin_rate=args.maintenance_margin_rate,
+        fee_rate=args.fee_rate,
+        slippage=args.slippage,
+        margin_mode=args.margin_mode,
+    )
+    result = run_pairs_arb(a_klines, b_klines, a_funding, b_funding, config)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"pairs_arb_{a_root}_{b_root}_{args.start}_{args.end}".replace(":", "-")
+    equity_path = output_dir / f"{tag}_equity.csv"
+    z_path = output_dir / f"{tag}_zscore.csv"
+    trades_path = output_dir / f"{tag}_trades.csv"
+    report_path = output_dir / f"{tag}_report.json"
+
+    result.equity.to_csv(equity_path, header=["equity"])
+    pd.concat(
+        {"spread": result.spread, "z_score": result.z_score, "position": result.position},
+        axis=1,
+    ).to_csv(z_path)
+    result.trades.to_csv(trades_path, index=False)
+    report = {
+        "leg_a": {"root": a_root, "perp": perp_a},
+        "leg_b": {"root": b_root, "perp": perp_b},
+        "start": args.start,
+        "end": args.end,
+        "config": {
+            "lookback": config.lookback,
+            "entry_z": config.entry_z,
+            "exit_z": config.exit_z,
+            "notional_per_leg": config.notional_per_leg,
+            "initial_margin_rate": config.initial_margin_rate,
+            "maintenance_margin_rate": config.maintenance_margin_rate,
+            "fee_rate": config.fee_rate,
+            "slippage": config.slippage,
+            "margin_mode": config.margin_mode,
+        },
+        "metrics": result.metrics,
+        "liquidated": result.liquidated,
+        "liquidation_time": (
+            str(result.liquidation_time) if result.liquidation_time is not None else None
+        ),
+    }
+    report_path.write_text(json.dumps(report, indent=2, default=str))
+
+    metrics = result.metrics
+    print()
+    print(f"Pairs arb : {a_root} ({perp_a}) vs {b_root} ({perp_b})")
+    print(f"Window    : {args.start} -> {args.end}  ({metrics['settlements']} settlements)")
+    print(f"Notional  : ${config.notional_per_leg:,.2f} per leg")
+    print(
+        f"Z-score   : entry=±{config.entry_z}  exit=±{config.exit_z}  lookback={config.lookback} bars"
+    )
+    print()
+    print(f"Round trips        : {metrics['num_round_trips']}")
+    print(f"Total return       : {metrics['total_return'] * 100:+.2f}%")
+    print(f"Annualised         : {metrics['annualised_return'] * 100:+.2f}%")
+    print(f"Funding received   : ${metrics['total_funding_received']:+.2f}")
+    print(f"Max drawdown       : {metrics['max_drawdown'] * 100:.2f}%")
+    print(f"Liquidated         : {result.liquidated}")
+    print()
+    print(f"Equity CSV  : {equity_path}")
+    print(f"Z-score CSV : {z_path}")
+    print(f"Trades CSV  : {trades_path}")
+    print(f"Report JSON : {report_path}")
+    return 0
+
+
 def _scan_fetcher_factory(source: str = "kucoin"):
     """Return a kline-fetcher callable for the given data source."""
     if source != "kucoin":
@@ -851,6 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_predict(args)
     if args.command == "funding-arb":
         return _cmd_funding_arb(args)
+    if args.command == "pairs-arb":
+        return _cmd_pairs_arb(args)
     if args.command == "sweep":
         return _cmd_sweep(args)
     if args.command == "scan":
