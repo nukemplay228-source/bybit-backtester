@@ -40,7 +40,9 @@ from bybit_backtest.data_kucoin import (
 from bybit_backtest.funding_arb import FundingArbConfig, run_funding_arb
 from bybit_backtest.plotting import buy_and_hold_equity, plot_equity_curve
 from bybit_backtest.predict import build_report
+from bybit_backtest.scanner import scan_assets
 from bybit_backtest.strategies import STRATEGY_REGISTRY, build_strategy
+from bybit_backtest.sweep import SUPPORTED_METRICS, walk_forward
 
 logger = logging.getLogger("bybit_backtest")
 
@@ -249,6 +251,120 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Bypass the on-disk data cache and re-download from KuCoin.",
     )
+
+    sweep = sub.add_parser(
+        "sweep",
+        help=(
+            "Walk-forward parameter search: optimise on a rolling train window, "
+            "evaluate on the next untouched test window."
+        ),
+    )
+    sweep.add_argument("--strategy", required=True, choices=sorted(STRATEGY_REGISTRY))
+    sweep.add_argument("--symbol", required=True, help="e.g. BTCUSDT or BTC-USDT")
+    sweep.add_argument(
+        "--interval", required=True, help="KuCoin/Bybit interval: 60, 240, 480, D, ..."
+    )
+    sweep.add_argument("--start", required=True, help="UTC start date, YYYY-MM-DD")
+    sweep.add_argument("--end", required=True, help="UTC end date, YYYY-MM-DD (exclusive)")
+    sweep.add_argument(
+        "--param-grid",
+        required=True,
+        help=(
+            "JSON object mapping each parameter name to a list of candidate values, "
+            'e.g. \'{"fast": [10, 20, 30], "slow": [50, 100, 200]}\'.'
+        ),
+    )
+    sweep.add_argument(
+        "--train-bars",
+        type=int,
+        required=True,
+        help="Number of bars in each in-sample (train) window.",
+    )
+    sweep.add_argument(
+        "--test-bars",
+        type=int,
+        required=True,
+        help="Number of bars in each out-of-sample (test) window.",
+    )
+    sweep.add_argument(
+        "--step-bars",
+        type=int,
+        default=None,
+        help="Step (in bars) between consecutive windows. Default: same as --test-bars.",
+    )
+    sweep.add_argument(
+        "--metric",
+        default="sharpe",
+        choices=SUPPORTED_METRICS,
+        help="Which performance metric to maximise on the train window.",
+    )
+    sweep.add_argument(
+        "--initial-cash", type=float, default=10_000.0, help="Initial cash in USDT."
+    )
+    sweep.add_argument(
+        "--fee-rate", type=float, default=0.001, help="Per-trade fee (default: 0.001)."
+    )
+    sweep.add_argument(
+        "--slippage", type=float, default=0.0005, help="One-sided slippage (default: 0.0005)."
+    )
+    sweep.add_argument(
+        "--output-dir",
+        default="results",
+        help="Directory where the walk-forward CSV is written.",
+    )
+    sweep.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass the on-disk kline cache and re-download from KuCoin.",
+    )
+
+    scan = sub.add_parser(
+        "scan",
+        help=(
+            "Run one strategy + one parameter set across many symbols and "
+            "return a Sharpe-ranked table — quick check whether an edge "
+            "generalises beyond a single asset."
+        ),
+    )
+    scan.add_argument("--strategy", required=True, choices=sorted(STRATEGY_REGISTRY))
+    scan.add_argument(
+        "--symbols",
+        required=True,
+        help=(
+            "Comma-separated list of symbols (e.g. 'BTCUSDT,ETHUSDT,SOLUSDT'). "
+            "USDT-quoted shorthand is auto-mapped to KuCoin 'BASE-USDT' pairs."
+        ),
+    )
+    scan.add_argument(
+        "--interval", required=True, help="KuCoin/Bybit interval: 60, 240, 480, D, ..."
+    )
+    scan.add_argument("--start", required=True, help="UTC start date, YYYY-MM-DD")
+    scan.add_argument("--end", required=True, help="UTC end date, YYYY-MM-DD (exclusive)")
+    scan.add_argument(
+        "--params",
+        default="{}",
+        help='JSON dict of strategy parameters, e.g. \'{"fast": 20, "slow": 50}\'.',
+    )
+    scan.add_argument(
+        "--initial-cash", type=float, default=10_000.0, help="Initial cash in USDT."
+    )
+    scan.add_argument(
+        "--fee-rate", type=float, default=0.001, help="Per-trade fee (default: 0.001)."
+    )
+    scan.add_argument(
+        "--slippage", type=float, default=0.0005, help="One-sided slippage (default: 0.0005)."
+    )
+    scan.add_argument(
+        "--output-dir",
+        default="results",
+        help="Directory where the scan CSV is written.",
+    )
+    scan.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass the on-disk kline cache and re-download from KuCoin.",
+    )
+
     return parser
 
 
@@ -544,6 +660,185 @@ def _cmd_funding_arb(args: argparse.Namespace) -> int:
     return 0
 
 
+def _scan_fetcher_factory(source: str = "kucoin"):
+    """Return a kline-fetcher callable for the given data source."""
+    if source != "kucoin":
+        raise ValueError(f"unsupported scanner data source: {source!r}")
+
+    def fetch(symbol: str, interval: str, start: str, end: str, *, use_cache: bool = True):
+        if "-" not in symbol and symbol.endswith("USDT"):
+            kucoin_symbol = f"{symbol[:-4]}-USDT"
+        else:
+            kucoin_symbol = symbol
+        return fetch_spot_klines(
+            kucoin_symbol, interval, start, end, use_cache=use_cache
+        )
+
+    return fetch
+
+
+def _cmd_sweep(args: argparse.Namespace) -> int:
+    try:
+        param_grid = json.loads(args.param_grid)
+    except json.JSONDecodeError as exc:
+        print(f"Invalid --param-grid JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(param_grid, dict):
+        print("--param-grid must decode to a JSON object", file=sys.stderr)
+        return 2
+    for k, v in param_grid.items():
+        if not isinstance(v, list) or not v:
+            print(
+                f"--param-grid value for {k!r} must be a non-empty list, got {v!r}",
+                file=sys.stderr,
+            )
+            return 2
+
+    fetcher = _scan_fetcher_factory("kucoin")
+    bars = fetcher(args.symbol, args.interval, args.start, args.end, use_cache=not args.no_cache)
+    if bars.empty:
+        print(
+            f"No klines returned for {args.symbol} {args.interval} {args.start}->{args.end}",
+            file=sys.stderr,
+        )
+        return 1
+    logger.info("Loaded %d bars for sweep on %s", len(bars), args.symbol)
+
+    wf = walk_forward(
+        bars,
+        args.strategy,
+        param_grid,
+        train_bars=args.train_bars,
+        test_bars=args.test_bars,
+        step_bars=args.step_bars,
+        metric=args.metric,
+        initial_cash=args.initial_cash,
+        fee_rate=args.fee_rate,
+        slippage=args.slippage,
+        interval=args.interval,
+    )
+    if wf.empty:
+        print(
+            "Walk-forward produced no windows. Check --train-bars / --test-bars vs available data.",
+            file=sys.stderr,
+        )
+        return 1
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"sweep_{args.strategy}_{args.symbol}_{args.interval}_{args.start}_{args.end}"
+    safe_tag = tag.replace(":", "-").replace(" ", "_")
+    csv_path = output_dir / f"{safe_tag}.csv"
+    wf.to_csv(csv_path, index=False)
+
+    print()
+    print(
+        f"Walk-forward {args.strategy} on {args.symbol} {args.interval}  "
+        f"{args.start} -> {args.end}"
+    )
+    print(
+        f"  windows={len(wf)}  train_bars={args.train_bars}  test_bars={args.test_bars}  "
+        f"metric={args.metric}"
+    )
+    print()
+    summary_cols = [
+        "window_idx",
+        "test_start",
+        "test_end",
+        "best_params",
+        f"train_{args.metric}",
+        f"test_{args.metric}",
+        "test_total_return_pct",
+        "test_max_drawdown_pct",
+        "test_num_trades",
+    ]
+    print(wf[summary_cols].to_string(index=False))
+    print()
+    test_metric_col = f"test_{args.metric}"
+    test_returns = wf["test_total_return_pct"]
+    print(
+        f"Out-of-sample {args.metric}: mean={wf[test_metric_col].mean():+.3f}  "
+        f"median={wf[test_metric_col].median():+.3f}  "
+        f"positive windows={int((wf[test_metric_col] > 0).sum())}/{len(wf)}"
+    )
+    print(
+        f"Out-of-sample return : mean={test_returns.mean():+.2f}%  "
+        f"sum={test_returns.sum():+.2f}%  "
+        f"positive windows={int((test_returns > 0).sum())}/{len(wf)}"
+    )
+    print()
+    print(f"CSV: {csv_path}")
+    return 0
+
+
+def _cmd_scan(args: argparse.Namespace) -> int:
+    try:
+        params = json.loads(args.params) if args.params else {}
+    except json.JSONDecodeError as exc:
+        print(f"Invalid --params JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(params, dict):
+        print("--params must decode to a JSON object", file=sys.stderr)
+        return 2
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if not symbols:
+        print("--symbols must contain at least one symbol", file=sys.stderr)
+        return 2
+
+    fetcher = _scan_fetcher_factory("kucoin")
+    df = scan_assets(
+        symbols,
+        args.interval,
+        args.start,
+        args.end,
+        args.strategy,
+        params,
+        initial_cash=args.initial_cash,
+        fee_rate=args.fee_rate,
+        slippage=args.slippage,
+        fetcher=fetcher,
+        use_cache=not args.no_cache,
+    )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"scan_{args.strategy}_{args.interval}_{args.start}_{args.end}"
+    safe_tag = tag.replace(":", "-").replace(" ", "_")
+    csv_path = output_dir / f"{safe_tag}.csv"
+    df.to_csv(csv_path, index=False)
+
+    print()
+    print(
+        f"Scan {args.strategy} {json.dumps(params)} across {len(symbols)} symbols, "
+        f"{args.interval}  {args.start} -> {args.end}"
+    )
+    print()
+    display_cols = [
+        "symbol",
+        "num_bars",
+        "total_return_pct",
+        "sharpe",
+        "max_drawdown_pct",
+        "num_trades",
+        "error",
+    ]
+    print(df[display_cols].to_string(index=False))
+    print()
+    success = df[df["error"].astype(str).eq("")] if "error" in df.columns else df
+    if not success.empty:
+        positive = int((success["total_return_pct"] > 0).sum())
+        print(
+            f"Profitable symbols: {positive}/{len(success)}  "
+            f"mean return={success['total_return_pct'].mean():+.2f}%  "
+            f"median return={success['total_return_pct'].median():+.2f}%  "
+            f"mean sharpe={success['sharpe'].mean():+.2f}"
+        )
+    print()
+    print(f"CSV: {csv_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -556,6 +851,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_predict(args)
     if args.command == "funding-arb":
         return _cmd_funding_arb(args)
+    if args.command == "sweep":
+        return _cmd_sweep(args)
+    if args.command == "scan":
+        return _cmd_scan(args)
     parser.error(f"Unknown command: {args.command}")
     return 2  # unreachable but keeps mypy happy
 
